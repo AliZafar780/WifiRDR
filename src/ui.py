@@ -1,223 +1,265 @@
-"""PyQt6 UI components for WiMap3D."""
-
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QGroupBox, QStatusBar, QPushButton,
-    QSpinBox, QFormLayout, QLineEdit, QTextEdit
+    QLabel, QPushButton, QSpinBox, QDoubleSpinBox,
+    QGroupBox, QStatusBar, QSplitter, QTextEdit
 )
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QFont
-
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor
 from data_model import PointCloudData
-from gl_view import GLView
-from ws_server import WiFiWebSocketServer
+from gl_view import PointCloudGLView
 
 
-class StatusPanel(QGroupBox):
-    """Panel displaying connection and metrics information."""
+class ConnectionStatusWidget(QWidget):
+    """Widget showing WebSocket connection status."""
 
     def __init__(self, parent=None):
-        super().__init__("Status", parent)
-        self._setup_ui()
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
 
-    def _setup_ui(self) -> None:
-        """Setup the UI layout."""
-        layout = QFormLayout()
+        self.status_label = QLabel("Disconnected")
+        self.status_label.setStyleSheet("color: red; font-weight: bold;")
 
-        self.connection_label = QLabel("Disconnected")
-        self.connection_label.setStyleSheet("color: red; font-weight: bold;")
-        layout.addRow("Connection:", self.connection_label)
+        self.client_count_label = QLabel("Clients: 0")
 
-        self.clients_label = QLabel("0")
-        layout.addRow("Clients:", self.clients_label)
+        layout.addWidget(QLabel("Status:"))
+        layout.addWidget(self.status_label)
+        layout.addStretch()
+        layout.addWidget(self.client_count_label)
 
-        self.point_count_label = QLabel("0")
-        layout.addRow("Points:", self.point_count_label)
+    def set_connected(self, connected: bool) -> None:
+        """Update the connection status display."""
+        if connected:
+            self.status_label.setText("Connected")
+            self.status_label.setStyleSheet("color: green; font-weight: bold;")
+        else:
+            self.status_label.setText("Disconnected")
+            self.status_label.setStyleSheet("color: red; font-weight: bold;")
 
-        self.rssi_range_label = QLabel("- / - dBm")
-        layout.addRow("RSSI Range:", self.rssi_range_label)
+    def set_client_count(self, count: int) -> None:
+        """Update the client count display."""
+        self.client_count_label.setText(f"Clients: {count}")
 
-        self.fps_label = QLabel("0 FPS")
-        layout.addRow("FPS:", self.fps_label)
+
+class StatsPanel(QWidget):
+    """Panel showing point cloud statistics."""
+
+    def __init__(self, point_cloud: PointCloudData, parent=None):
+        super().__init__(parent)
+        self.point_cloud = point_cloud
+
+        layout = QVBoxLayout(self)
+
+        # Point count group
+        points_group = QGroupBox("Point Statistics")
+        points_layout = QVBoxLayout(points_group)
+
+        self.point_count_label = QLabel("Points: 0")
+        self.max_points_label = QLabel("Max Points: 0")
+        self.received_label = QLabel("Total Received: 0")
+        self.dropped_label = QLabel("Total Dropped: 0")
+
+        points_layout.addWidget(self.point_count_label)
+        points_layout.addWidget(self.max_points_label)
+        points_layout.addWidget(self.received_label)
+        points_layout.addWidget(self.dropped_label)
+
+        layout.addWidget(points_group)
+
+        # Bounds group
+        bounds_group = QGroupBox("Bounding Box")
+        bounds_layout = QVBoxLayout(bounds_group)
+
+        self.x_bounds_label = QLabel("X: -")
+        self.y_bounds_label = QLabel("Y: -")
+        self.z_bounds_label = QLabel("Z: -")
+
+        bounds_layout.addWidget(self.x_bounds_label)
+        bounds_layout.addWidget(self.y_bounds_label)
+        bounds_layout.addWidget(self.z_bounds_label)
+
+        layout.addWidget(bounds_group)
+
+        # RSSI legend
+        legend_group = QGroupBox("RSSI Color Legend")
+        legend_layout = QVBoxLayout(legend_group)
+
+        legend_text = QLabel(
+            "<span style='color: #00FF00'>■</span> -30 dBm (Excellent)<br>"
+            "<span style='color: #FFFF00'>■</span> -50 dBm (Good)<br>"
+            "<span style='color: #FF8800'>■</span> -70 dBm (Fair)<br>"
+            "<span style='color: #FF0000'>■</span> -90 dBm (Poor)"
+        )
+        legend_text.setTextFormat(Qt.TextFormat.RichText)
+        legend_layout.addWidget(legend_text)
+
+        layout.addWidget(legend_group)
+
+        # Controls
+        controls_group = QGroupBox("Controls")
+        controls_layout = QVBoxLayout(controls_group)
 
         self.clear_btn = QPushButton("Clear Points")
-        layout.addRow(self.clear_btn)
+        controls_layout.addWidget(self.clear_btn)
 
-        self.setLayout(layout)
+        # Point size control
+        size_layout = QHBoxLayout()
+        size_layout.addWidget(QLabel("Point Size:"))
+        self.point_size_spin = QDoubleSpinBox()
+        self.point_size_spin.setRange(1.0, 20.0)
+        self.point_size_spin.setValue(4.0)
+        self.point_size_spin.setSingleStep(0.5)
+        size_layout.addWidget(self.point_size_spin)
+        controls_layout.addLayout(size_layout)
 
-    def update_connection(self, connected: bool) -> None:
-        """Update connection status display."""
-        if connected:
-            self.connection_label.setText("Connected")
-            self.connection_label.setStyleSheet("color: green; font-weight: bold;")
-        else:
-            self.connection_label.setText("Disconnected")
-            self.connection_label.setStyleSheet("color: red; font-weight: bold;")
+        layout.addWidget(controls_group)
 
-    def update_clients(self, count: int) -> None:
-        """Update client count display."""
-        self.clients_label.setText(str(count))
+        layout.addStretch()
 
-    def update_metrics(self, point_count: int, rssi_min: int, rssi_max: int, fps: float) -> None:
-        """Update metrics display."""
-        self.point_count_label.setText(f"{point_count:,}")
-        self.rssi_range_label.setText(f"{rssi_min} / {rssi_max} dBm")
-        self.fps_label.setText(f"{fps:.1f} FPS")
+        # Update timer
+        self._update_timer = QTimer(self)
+        self._update_timer.timeout.connect(self.update_stats)
+        self._update_timer.start(500)  # Update every 500ms
 
+    def update_stats(self) -> None:
+        """Update the statistics display."""
+        stats = self.point_cloud.get_stats()
+        bounds = self.point_cloud.get_bounds()
 
-class ConnectionPanel(QGroupBox):
-    """Panel for WebSocket connection settings."""
+        self.point_count_label.setText(f"Points: {stats['count']:,}")
+        self.max_points_label.setText(f"Max Points: {stats['max']:,}")
+        self.received_label.setText(f"Total Received: {stats['total_received']:,}")
+        self.dropped_label.setText(f"Total Dropped: {stats['total_dropped']:,}")
 
-    def __init__(self, parent=None):
-        super().__init__("Connection Settings", parent)
-        self._setup_ui()
-
-    def _setup_ui(self) -> None:
-        """Setup the UI layout."""
-        layout = QFormLayout()
-
-        self.port_input = QSpinBox()
-        self.port_input.setRange(1024, 65535)
-        self.port_input.setValue(8765)
-        self.port_input.setEnabled(False)
-        layout.addRow("Port:", self.port_input)
-
-        self.address_label = QLabel("ws://0.0.0.0:8765")
-        layout.addRow("Address:", self.address_label)
-
-        self.setLayout(layout)
+        self.x_bounds_label.setText(f"X: [{bounds[0]:.2f}, {bounds[1]:.2f}]")
+        self.y_bounds_label.setText(f"Y: [{bounds[2]:.2f}, {bounds[3]:.2f}]")
+        self.z_bounds_label.setText(f"Z: [{bounds[4]:.2f}, {bounds[5]:.2f}]")
 
 
-class LegendPanel(QGroupBox):
-    """Panel showing RSSI color legend."""
+class LogPanel(QWidget):
+    """Panel for displaying log messages."""
 
     def __init__(self, parent=None):
-        super().__init__("RSSI Legend", parent)
-        self._setup_ui()
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
 
-    def _setup_ui(self) -> None:
-        """Setup the legend display."""
-        layout = QVBoxLayout()
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMaximumBlockCount(1000)
+        layout.addWidget(self.log_text)
 
-        legend_text = """
-        <table cellpadding="5">
-        <tr><td bgcolor="#000080" width="30">&nbsp;</td><td>Very Weak (&lt; -80 dBm)</td></tr>
-        <tr><td bgcolor="#00FFFF" width="30">&nbsp;</td><td>Weak (-80 to -70 dBm)</td></tr>
-        <tr><td bgcolor="#00FF00" width="30">&nbsp;</td><td>Good (-70 to -60 dBm)</td></tr>
-        <tr><td bgcolor="#FFFF00" width="30">&nbsp;</td><td>Strong (-60 to -50 dBm)</td></tr>
-        <tr><td bgcolor="#FF3300" width="30">&nbsp;</td><td>Excellent (&gt; -50 dBm)</td></tr>
-        </table>
-        """
+        self.clear_btn = QPushButton("Clear Log")
+        layout.addWidget(self.clear_btn)
 
-        self.legend_label = QLabel(legend_text)
-        self.legend_label.setTextFormat(Qt.TextFormat.RichText)
-        layout.addWidget(self.legend_label)
+        self.clear_btn.clicked.connect(self.log_text.clear)
 
-        self.setLayout(layout)
-
-
-class ControlsPanel(QGroupBox):
-    """Panel showing keyboard/mouse controls."""
-
-    def __init__(self, parent=None):
-        super().__init__("Controls", parent)
-        self._setup_ui()
-
-    def _setup_ui(self) -> None:
-        """Setup the controls display."""
-        layout = QVBoxLayout()
-
-        controls_text = """
-        <b>Mouse:</b><br>
-        &nbsp;&nbsp;• Left + Drag: Orbit<br>
-        &nbsp;&nbsp;• Right + Drag: Pan<br>
-        &nbsp;&nbsp;• Scroll: Zoom<br><br>
-        <b>Keyboard:</b><br>
-        &nbsp;&nbsp;• R: Reset View
-        """
-
-        self.controls_label = QLabel(controls_text)
-        self.controls_label.setTextFormat(Qt.TextFormat.RichText)
-        layout.addWidget(self.controls_label)
-
-        self.setLayout(layout)
+    def append_log(self, message: str) -> None:
+        """Append a message to the log."""
+        self.log_text.append(message)
 
 
 class MainWindow(QMainWindow):
     """Main application window."""
 
-    def __init__(self, data: PointCloudData, ws_server: WiFiWebSocketServer):
+    clear_requested = pyqtSignal()
+    point_size_changed = pyqtSignal(float)
+
+    def __init__(self, point_cloud: PointCloudData, port: int = 8765):
         super().__init__()
-        self.data = data
-        self.ws_server = ws_server
-        self.setWindowTitle("WiMap3D - Wi-Fi Signal Visualizer")
-        self.setMinimumSize(1200, 800)
+        self.point_cloud = point_cloud
+        self.port = port
 
-        self._setup_ui()
-        self._setup_timer()
+        self.setWindowTitle("WiMap3D - Wi-Fi Signal Heatmap")
+        self.setMinimumSize(1024, 768)
 
-    def _setup_ui(self) -> None:
-        """Setup the main UI layout."""
+        # Central widget
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
 
         main_layout = QHBoxLayout(central_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.gl_view = GLView(self.data, self)
-        main_layout.addWidget(self.gl_view, stretch=3)
+        # Splitter for resizable panels
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        main_layout.addWidget(splitter)
 
-        sidebar = QWidget()
-        sidebar_layout = QVBoxLayout(sidebar)
-        sidebar_layout.setSpacing(10)
+        # Left panel: GL view
+        self.gl_view = PointCloudGLView(point_cloud)
+        splitter.addWidget(self.gl_view)
 
-        self.connection_panel = ConnectionPanel()
-        sidebar_layout.addWidget(self.connection_panel)
+        # Right panel: controls and stats
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(10, 10, 10, 10)
 
-        self.status_panel = StatusPanel()
-        self.status_panel.clear_btn.clicked.connect(self._clear_points)
-        sidebar_layout.addWidget(self.status_panel)
+        # Connection status
+        self.connection_widget = ConnectionStatusWidget()
+        right_layout.addWidget(self.connection_widget)
 
-        self.legend_panel = LegendPanel()
-        sidebar_layout.addWidget(self.legend_panel)
+        # Port info
+        port_label = QLabel(f"WebSocket Port: {port}")
+        right_layout.addWidget(port_label)
 
-        self.controls_panel = ControlsPanel()
-        sidebar_layout.addWidget(self.controls_panel)
+        # Stats panel
+        self.stats_panel = StatsPanel(point_cloud)
+        self.stats_panel.clear_btn.clicked.connect(self._on_clear_clicked)
+        self.stats_panel.point_size_spin.valueChanged.connect(self._on_point_size_changed)
+        right_layout.addWidget(self.stats_panel)
 
-        sidebar_layout.addStretch()
+        # Log panel
+        self.log_panel = LogPanel()
+        self.log_panel.setMaximumHeight(200)
+        right_layout.addWidget(self.log_panel)
 
-        main_layout.addWidget(sidebar, stretch=1)
+        splitter.addWidget(right_panel)
 
+        # Set splitter proportions (70% GL view, 30% panel)
+        splitter.setSizes([700, 300])
+
+        # Status bar
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("Ready")
+        self.status_bar.showMessage("Ready - Use sample_sender.py to stream data")
 
-    def _setup_timer(self) -> None:
-        """Setup the update timer for UI refresh."""
-        self._update_timer = QTimer(self)
-        self._update_timer.timeout.connect(self._update_ui)
-        self._update_timer.start(100)
+        # Animation timer to keep GL view updated
+        self._anim_timer = QTimer(self)
+        self._anim_timer.timeout.connect(self._on_anim_tick)
+        self._anim_timer.start(33)  # ~30 FPS
 
-    def _update_ui(self) -> None:
-        """Update UI elements with current state."""
-        if self.ws_server:
-            self.status_panel.update_connection(self.ws_server.is_running())
-            self.status_panel.update_clients(self.ws_server.get_client_count())
+        self._frame_count = 0
 
-        rssi_min, rssi_max = self.data.get_rssi_range()
-        self.status_panel.update_metrics(
-            len(self.data),
-            rssi_min,
-            rssi_max,
-            self.gl_view.get_fps()
-        )
+    def _on_anim_tick(self) -> None:
+        """Animation tick - request GL view update periodically."""
+        self._frame_count += 1
+        # Update every frame to show new points
+        self.gl_view.request_update()
 
-    def _clear_points(self) -> None:
-        """Clear all points from the visualization."""
-        self.data.clear()
+        # Update stats every 10 frames
+        if self._frame_count % 10 == 0:
+            self.stats_panel.update_stats()
+
+    def _on_clear_clicked(self) -> None:
+        """Handle clear button click."""
+        self.point_cloud.clear()
+        self.gl_view.request_update()
+        self.clear_requested.emit()
+        self.log_panel.append_log("Point cloud cleared")
+
+    def _on_point_size_changed(self, size: float) -> None:
+        """Handle point size change."""
+        self.gl_view._point_size = size
         self.gl_view.update()
+        self.point_size_changed.emit(size)
 
-    def closeEvent(self, event) -> None:
-        """Handle window close event."""
-        if self.ws_server:
-            self.ws_server.stop()
-        event.accept()
+    def set_connected(self, connected: bool) -> None:
+        """Update connection status."""
+        self.connection_widget.set_connected(connected)
+
+    def set_client_count(self, count: int) -> None:
+        """Update client count."""
+        self.connection_widget.set_client_count(count)
+
+    def log_message(self, message: str) -> None:
+        """Add a log message."""
+        self.log_panel.append_log(message)

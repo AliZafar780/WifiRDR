@@ -1,93 +1,101 @@
-"""Data model for Wi-Fi signal samples."""
-
 from dataclasses import dataclass, field
 from typing import Optional
-from datetime import datetime
-import json
+from collections import deque
+import threading
+import time
 
 
 @dataclass
 class WiFiSample:
-    """Represents a single Wi-Fi signal measurement at a 3D location."""
+    """Represents a single Wi-Fi signal measurement at a 3D position."""
     x: float
     y: float
-    z: float
-    rssi: int
+    z: float = 0.0
+    rssi: float = -70.0
     ssid: Optional[str] = None
     bssid: Optional[str] = None
-    frequency: Optional[int] = None
-    timestamp: Optional[datetime] = None
+    timestamp: float = field(default_factory=time.time)
 
     @classmethod
-    def from_json(cls, data: dict) -> 'WiFiSample':
-        """Parse a WiFiSample from JSON dictionary."""
-        timestamp = None
-        if 'timestamp' in data and data['timestamp']:
-            try:
-                timestamp = datetime.fromisoformat(data['timestamp'].replace('Z', '+00:00'))
-            except (ValueError, AttributeError):
-                timestamp = None
-
+    def from_json(cls, data: dict) -> "WiFiSample":
+        """Create a WiFiSample from a JSON dictionary."""
         return cls(
-            x=float(data['x']),
-            y=float(data['y']),
-            z=float(data['z']),
-            rssi=int(data['rssi']),
-            ssid=data.get('ssid'),
-            bssid=data.get('bssid'),
-            frequency=data.get('frequency'),
-            timestamp=timestamp
+            x=float(data.get("x", 0)),
+            y=float(data.get("y", 0)),
+            z=float(data.get("z", 0)),
+            rssi=float(data.get("rssi", -70)),
+            ssid=data.get("ssid"),
+            bssid=data.get("bssid"),
+            timestamp=float(data.get("timestamp", time.time()))
         )
 
     def is_valid(self) -> bool:
         """Check if the sample has valid required fields."""
-        if not isinstance(self.rssi, int):
+        try:
+            _ = float(self.x)
+            _ = float(self.y)
+            _ = float(self.z)
+            _ = float(self.rssi)
+            return True
+        except (TypeError, ValueError):
             return False
-        if self.rssi < -120 or self.rssi > 0:
-            return False
-        return True
 
 
 class PointCloudData:
-    """Manages the collection of Wi-Fi samples with size limits."""
+    """Thread-safe container for point cloud data with size limits."""
 
     def __init__(self, max_points: int = 100000):
         self.max_points = max_points
-        self.samples: list[WiFiSample] = []
-        self._rssi_min: Optional[int] = None
-        self._rssi_max: Optional[int] = None
+        self._points: deque[WiFiSample] = deque(maxlen=max_points)
+        self._lock = threading.RLock()
+        self._total_received = 0
+        self._total_dropped = 0
 
-    def add_sample(self, sample: WiFiSample) -> bool:
-        """Add a sample, enforcing size limit (FIFO). Returns True if added."""
-        if not sample.is_valid():
-            return False
+    def add(self, sample: WiFiSample) -> bool:
+        """Add a sample to the point cloud. Returns True if added, False if dropped."""
+        with self._lock:
+            self._total_received += 1
+            dropped = len(self._points) >= self.max_points
+            if dropped:
+                self._total_dropped += 1
+            self._points.append(sample)
+            return not dropped
 
-        self.samples.append(sample)
+    def add_many(self, samples: list[WiFiSample]) -> int:
+        """Add multiple samples. Returns number of samples added."""
+        added = 0
+        with self._lock:
+            for sample in samples:
+                if self.add(sample):
+                    added += 1
+        return added
 
-        if len(self.samples) > self.max_points:
-            self.samples.pop(0)
-
-        self._update_rssi_range(sample.rssi)
-        return True
-
-    def _update_rssi_range(self, rssi: int) -> None:
-        """Update cached RSSI range."""
-        if self._rssi_min is None or rssi < self._rssi_min:
-            self._rssi_min = rssi
-        if self._rssi_max is None or rssi > self._rssi_max:
-            self._rssi_max = rssi
-
-    def get_rssi_range(self) -> tuple[int, int]:
-        """Return (min, max) RSSI values."""
-        if self._rssi_min is None:
-            return (-90, -30)
-        return (self._rssi_min, self._rssi_max)
+    def get_all(self) -> list[WiFiSample]:
+        """Get a snapshot of all points (thread-safe copy)."""
+        with self._lock:
+            return list(self._points)
 
     def clear(self) -> None:
-        """Clear all samples."""
-        self.samples.clear()
-        self._rssi_min = None
-        self._rssi_max = None
+        """Clear all points."""
+        with self._lock:
+            self._points.clear()
 
-    def __len__(self) -> int:
-        return len(self.samples)
+    def get_stats(self) -> dict:
+        """Get statistics about the point cloud."""
+        with self._lock:
+            return {
+                "count": len(self._points),
+                "max": self.max_points,
+                "total_received": self._total_received,
+                "total_dropped": self._total_dropped
+            }
+
+    def get_bounds(self) -> tuple:
+        """Get the bounding box of all points."""
+        with self._lock:
+            if not self._points:
+                return (-10, 10, -10, 10, -10, 10)
+            xs = [p.x for p in self._points]
+            ys = [p.y for p in self._points]
+            zs = [p.z for p in self._points]
+            return (min(xs), max(xs), min(ys), max(ys), min(zs), max(zs))

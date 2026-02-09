@@ -1,89 +1,138 @@
-"""Asyncio WebSocket server for receiving Wi-Fi samples."""
-
 import asyncio
 import json
 import logging
-from queue import Queue
-from typing import Optional
-import websockets
-from websockets.server import WebSocketServerProtocol
-
-from data_model import WiFiSample
+from typing import Optional, Callable
+from websockets.server import WebSocketServerProtocol, serve
+from websockets.exceptions import ConnectionClosed
+from data_model import WiFiSample, PointCloudData
 
 
 logger = logging.getLogger(__name__)
 
 
-class WiFiWebSocketServer:
-    """WebSocket server that receives Wi-Fi samples and enqueues them."""
+class WebSocketServer:
+    """WebSocket server that receives Wi-Fi samples and adds them to a point cloud."""
 
-    def __init__(self, output_queue: Queue, host: str = "0.0.0.0", port: int = 8765):
-        self.output_queue = output_queue
+    def __init__(
+        self,
+        point_cloud: PointCloudData,
+        host: str = "0.0.0.0",
+        port: int = 8765,
+        on_connect: Optional[Callable[[], None]] = None,
+        on_disconnect: Optional[Callable[[], None]] = None
+    ):
+        self.point_cloud = point_cloud
         self.host = host
         self.port = port
-        self.server: Optional[websockets.WebSocketServer] = None
-        self.connected_clients: set[WebSocketServerProtocol] = set()
+        self.on_connect = on_connect
+        self.on_disconnect = on_disconnect
+        self._server: Optional[asyncio.Server] = None
+        self._connected_clients: set[WebSocketServerProtocol] = set()
         self._running = False
-        self._task: Optional[asyncio.Task] = None
 
     async def _handle_client(self, websocket: WebSocketServerProtocol, path: str) -> None:
-        """Handle a WebSocket client connection."""
-        client_addr = websocket.remote_address
+        """Handle a single WebSocket client connection."""
+        self._connected_clients.add(websocket)
+        client_addr = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}"
         logger.info(f"Client connected: {client_addr}")
-        self.connected_clients.add(websocket)
+
+        if self.on_connect:
+            try:
+                self.on_connect()
+            except Exception as e:
+                logger.error(f"Error in on_connect callback: {e}")
 
         try:
             async for message in websocket:
-                try:
-                    data = json.loads(message)
-                    sample = WiFiSample.from_json(data)
-                    self.output_queue.put(sample)
-                except json.JSONDecodeError as e:
-                    logger.warning(f"Invalid JSON from {client_addr}: {e}")
-                except (KeyError, ValueError, TypeError) as e:
-                    logger.warning(f"Invalid sample from {client_addr}: {e}")
-        except websockets.exceptions.ConnectionClosed:
+                await self._process_message(message)
+        except ConnectionClosed:
             logger.info(f"Client disconnected: {client_addr}")
+        except Exception as e:
+            logger.error(f"Error handling client {client_addr}: {e}")
         finally:
-            self.connected_clients.discard(websocket)
+            self._connected_clients.discard(websocket)
+            if not self._connected_clients and self.on_disconnect:
+                try:
+                    self.on_disconnect()
+                except Exception as e:
+                    logger.error(f"Error in on_disconnect callback: {e}")
 
-    async def _start_server(self) -> None:
+    async def _process_message(self, message: str) -> None:
+        """Parse and process a single JSON message."""
+        try:
+            data = json.loads(message)
+
+            # Handle single sample or batch
+            if isinstance(data, list):
+                samples = []
+                for item in data:
+                    try:
+                        sample = WiFiSample.from_json(item)
+                        if sample.is_valid():
+                            samples.append(sample)
+                        else:
+                            logger.warning(f"Invalid sample data: {item}")
+                    except Exception as e:
+                        logger.warning(f"Failed to parse sample: {e}")
+                if samples:
+                    self.point_cloud.add_many(samples)
+                    logger.debug(f"Added {len(samples)} samples from batch")
+            else:
+                sample = WiFiSample.from_json(data)
+                if sample.is_valid():
+                    self.point_cloud.add(sample)
+                    logger.debug(f"Added sample: {sample}")
+                else:
+                    logger.warning(f"Invalid sample data: {data}")
+
+        except json.JSONDecodeError as e:
+            logger.warning(f"Invalid JSON received: {e}")
+        except Exception as e:
+            logger.error(f"Error processing message: {e}")
+
+    async def start(self) -> None:
         """Start the WebSocket server."""
-        self.server = await websockets.serve(
+        self._running = True
+        logger.info(f"Starting WebSocket server on {self.host}:{self.port}")
+        self._server = await serve(
             self._handle_client,
             self.host,
             self.port,
-            ping_interval=30,
+            ping_interval=20,
             ping_timeout=10
         )
-        logger.info(f"WebSocket server started on ws://{self.host}:{self.port}")
-        self._running = True
-        await self.server.wait_closed()
+        logger.info("WebSocket server started")
 
-    def start(self) -> None:
-        """Start the server in a new event loop (call from thread)."""
-        def run_loop():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(self._start_server())
-            finally:
-                loop.close()
-
-        import threading
-        self._thread = threading.Thread(target=run_loop, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        """Stop the server."""
+    async def stop(self) -> None:
+        """Stop the WebSocket server."""
         self._running = False
-        if self.server:
-            self.server.close()
+        logger.info("Stopping WebSocket server...")
+
+        # Close all connected clients
+        close_tasks = [client.close() for client in self._connected_clients]
+        if close_tasks:
+            await asyncio.gather(*close_tasks, return_exceptions=True)
+        self._connected_clients.clear()
+
+        if self._server:
+            self._server.close()
+            await self._server.wait_closed()
+        logger.info("WebSocket server stopped")
 
     def is_running(self) -> bool:
         """Check if the server is running."""
-        return self._running and self.server is not None
+        return self._running
 
-    def get_client_count(self) -> int:
-        """Return the number of connected clients."""
-        return len(self.connected_clients)
+    def client_count(self) -> int:
+        """Get the number of connected clients."""
+        return len(self._connected_clients)
+
+    async def run_forever(self) -> None:
+        """Run the server until stopped."""
+        await self.start()
+        try:
+            await asyncio.Future()  # Run forever
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await self.stop()

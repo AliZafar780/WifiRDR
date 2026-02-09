@@ -24,7 +24,7 @@ wheels/
 venv/
 env/
 ENV/
-.venv
+.venv/
 
 # IDE
 .vscode/
@@ -37,6 +37,9 @@ ENV/
 .DS_Store
 Thumbs.db
 
-# Application specific
+# Logs
 *.log
+
+# Application data
+*.db
 *.sqlite

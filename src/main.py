@@ -40,20 +40,20 @@ class AsyncHelper(QObject):
         self.ws_server = ws_server
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.thread: Optional[threading.Thread] = None
-        self._running = False
+        self._stop_event = threading.Event()
 
     def start(self) -> None:
         """Start the async event loop in a separate thread."""
+        self._stop_event.clear()
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
-        self._running = True
         self.thread.start()
 
     def stop(self) -> None:
         """Stop the async event loop."""
-        self._running = False
+        self._stop_event.set()
         if self.loop:
             asyncio.run_coroutine_threadsafe(self.ws_server.stop(), self.loop)
-        if self.thread:
+        if self.thread and self.thread.is_alive():
             self.thread.join(timeout=2.0)
 
     def _run_loop(self) -> None:
@@ -64,7 +64,7 @@ class AsyncHelper(QObject):
         try:
             self.loop.run_until_complete(self.ws_server.start())
             # Keep the loop running
-            while self._running:
+            while not self._stop_event.is_set():
                 self.loop.run_until_complete(asyncio.sleep(0.1))
         except Exception as e:
             logger.error(f"Server error: {e}")
@@ -86,8 +86,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--host",
         type=str,
-        default="0.0.0.0",
-        help="WebSocket server host (default: 0.0.0.0)"
+        default="127.0.0.1",
+        help="WebSocket server host (default: 127.0.0.1)"
     )
     parser.add_argument(
         "--max-points",

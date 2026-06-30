@@ -1,8 +1,19 @@
+import logging
 from dataclasses import dataclass, field
 from typing import Optional
 from collections import deque
 import threading
 import time
+
+
+logger = logging.getLogger(__name__)
+
+
+# Valid coordinate range bounds
+COORD_MIN: float = -10000.0
+COORD_MAX: float = 10000.0
+RSSI_MIN_VALID: float = -100.0
+RSSI_MAX_VALID: float = 0.0
 
 
 @dataclass
@@ -30,22 +41,36 @@ class WiFiSample:
         )
 
     def is_valid(self) -> bool:
-        """Check if the sample has valid required fields."""
+        """Check if the sample has valid required fields and reasonable value ranges."""
         try:
-            _ = float(self.x)
-            _ = float(self.y)
-            _ = float(self.z)
-            _ = float(self.rssi)
-            return True
+            x = float(self.x)
+            y = float(self.y)
+            z = float(self.z)
+            rssi = float(self.rssi)
         except (TypeError, ValueError):
             return False
+
+        # Coordinate range validation
+        if not (COORD_MIN <= x <= COORD_MAX):
+            return False
+        if not (COORD_MIN <= y <= COORD_MAX):
+            return False
+        if not (COORD_MIN <= z <= COORD_MAX):
+            return False
+
+        # RSSI range validation (typical Wi-Fi: -100 dBm to 0 dBm)
+        if not (RSSI_MIN_VALID <= rssi <= RSSI_MAX_VALID):
+            return False
+
+        return True
 
 
 class PointCloudData:
     """Thread-safe container for point cloud data with size limits."""
 
-    def __init__(self, max_points: int = 100000):
+    def __init__(self, max_points: int = 100000, max_batch_size: int = 1000):
         self.max_points = max_points
+        self.max_batch_size = max_batch_size
         self._points: deque[WiFiSample] = deque(maxlen=max_points)
         self._lock = threading.RLock()
         self._total_received = 0
@@ -63,6 +88,14 @@ class PointCloudData:
 
     def add_many(self, samples: list[WiFiSample]) -> int:
         """Add multiple samples. Returns number of samples added."""
+        # Enforce maximum batch size
+        if len(samples) > self.max_batch_size:
+            logger.warning(
+                f"Batch size {len(samples)} exceeds max_batch_size "
+                f"{self.max_batch_size}, truncating to {self.max_batch_size}"
+            )
+            samples = samples[:self.max_batch_size]
+
         added = 0
         with self._lock:
             for sample in samples:

@@ -6,6 +6,9 @@ from websockets.server import WebSocketServerProtocol, serve
 from websockets.exceptions import ConnectionClosed
 from data_model import WiFiSample, PointCloudData
 
+MAX_MESSAGE_SIZE: int = 65536  # 64KB max incoming WebSocket message size
+MAX_BATCH_SIZE: int = 1000  # Max samples in a single batch
+
 
 logger = logging.getLogger(__name__)
 
@@ -16,18 +19,21 @@ class WebSocketServer:
     def __init__(
         self,
         point_cloud: PointCloudData,
-        host: str = "0.0.0.0",
+        host: str = "127.0.0.1",
         port: int = 8765,
+        required_token: Optional[str] = None,
         on_connect: Optional[Callable[[], None]] = None,
         on_disconnect: Optional[Callable[[], None]] = None
     ):
         self.point_cloud = point_cloud
         self.host = host
         self.port = port
+        self.required_token = required_token
         self.on_connect = on_connect
         self.on_disconnect = on_disconnect
         self._server: Optional[asyncio.Server] = None
         self._connected_clients: set[WebSocketServerProtocol] = set()
+        self._authenticated_clients: set[WebSocketServerProtocol] = set()
         self._running = False
 
     async def _handle_client(self, websocket: WebSocketServerProtocol, path: str) -> None:
@@ -35,6 +41,35 @@ class WebSocketServer:
         self._connected_clients.add(websocket)
         client_addr = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}"
         logger.info(f"Client connected: {client_addr}")
+
+        # Authentication step
+        if self.required_token is not None:
+            try:
+                auth_message = await asyncio.wait_for(
+                    websocket.recv(), timeout=10.0
+                )
+                try:
+                    auth_data = json.loads(auth_message)
+                except json.JSONDecodeError:
+                    logger.warning(f"Authentication failed (invalid JSON) from {client_addr}")
+                    await websocket.close(code=4001, reason="Invalid auth format")
+                    self._connected_clients.discard(websocket)
+                    return
+
+                token = auth_data.get("auth")
+                if not token or token != self.required_token:
+                    logger.warning(f"Authentication failed (invalid token) from {client_addr}")
+                    await websocket.close(code=4001, reason="Invalid auth token")
+                    self._connected_clients.discard(websocket)
+                    return
+
+                logger.info(f"Client authenticated: {client_addr}")
+                self._authenticated_clients.add(websocket)
+            except asyncio.TimeoutError:
+                logger.warning(f"Authentication timeout for {client_addr}")
+                await websocket.close(code=4001, reason="Auth timeout")
+                self._connected_clients.discard(websocket)
+                return
 
         if self.on_connect:
             try:
@@ -51,6 +86,7 @@ class WebSocketServer:
             logger.error(f"Error handling client {client_addr}: {e}")
         finally:
             self._connected_clients.discard(websocket)
+            self._authenticated_clients.discard(websocket)
             if not self._connected_clients and self.on_disconnect:
                 try:
                     self.on_disconnect()
@@ -59,11 +95,27 @@ class WebSocketServer:
 
     async def _process_message(self, message: str) -> None:
         """Parse and process a single JSON message."""
+        # Enforce maximum message size
+        if len(message) > MAX_MESSAGE_SIZE:
+            logger.warning(
+                f"Message too large: {len(message)} bytes "
+                f"(max {MAX_MESSAGE_SIZE} bytes)"
+            )
+            return
+
         try:
             data = json.loads(message)
 
             # Handle single sample or batch
             if isinstance(data, list):
+                # Enforce maximum batch size
+                if len(data) > MAX_BATCH_SIZE:
+                    logger.warning(
+                        f"Batch size {len(data)} exceeds maximum {MAX_BATCH_SIZE}, "
+                        f"truncating to {MAX_BATCH_SIZE}"
+                    )
+                    data = data[:MAX_BATCH_SIZE]
+
                 samples = []
                 for item in data:
                     try:

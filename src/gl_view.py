@@ -49,6 +49,12 @@ class PointCloudGLView(QOpenGLWidget):
         self._update_timer.timeout.connect(self._on_update_timer)
         self._update_timer.start(33)  # ~30 FPS
 
+    def closeEvent(self, event) -> None:
+        """Clean up timers when the widget is closed."""
+        if self._update_timer.isActive():
+            self._update_timer.stop()
+        super().closeEvent(event)
+
     def _on_update_timer(self) -> None:
         """Called periodically to update the view."""
         if self._auto_rotate:

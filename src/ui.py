@@ -121,6 +121,11 @@ class StatsPanel(QWidget):
         self._update_timer.timeout.connect(self.update_stats)
         self._update_timer.start(500)  # Update every 500ms
 
+    def cleanup(self) -> None:
+        """Stop the update timer. Called on shutdown."""
+        if self._update_timer.isActive():
+            self._update_timer.stop()
+
     def update_stats(self) -> None:
         """Update the statistics display."""
         stats = self.point_cloud.get_stats()
@@ -228,6 +233,14 @@ class MainWindow(QMainWindow):
         self._anim_timer.start(33)  # ~30 FPS
 
         self._frame_count = 0
+
+    def closeEvent(self, event) -> None:
+        """Clean up timers and resources when window is closed."""
+        if self._anim_timer.isActive():
+            self._anim_timer.stop()
+        self.stats_panel.cleanup()
+        self.gl_view.closeEvent(event)
+        super().closeEvent(event)
 
     def _on_anim_tick(self) -> None:
         """Animation tick - request GL view update periodically."""
